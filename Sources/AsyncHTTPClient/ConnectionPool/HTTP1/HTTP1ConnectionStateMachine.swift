@@ -41,8 +41,8 @@ struct HTTP1ConnectionStateMachine {
         }
 
         case sendRequestHead(HTTPRequestHead, startBody: Bool)
-        case sendBodyPart(IOData)
-        case sendRequestEnd
+        case sendBodyPart(IOData, EventLoopPromise<Void>?)
+        case sendRequestEnd(EventLoopPromise<Void>?)
 
         case pauseRequestBodyStream
         case resumeRequestBodyStream
@@ -50,12 +50,12 @@ struct HTTP1ConnectionStateMachine {
         case forwardResponseHead(HTTPResponseHead, pauseRequestBodyStream: Bool)
         case forwardResponseBodyParts(CircularBuffer<ByteBuffer>)
 
-        case failRequest(Error, FinalStreamAction)
-        case succeedRequest(FinalStreamAction, CircularBuffer<ByteBuffer>)
+        case failRequest(Error, FinalStreamAction, EventLoopPromise<Void>?)
+        case succeedRequest(FinalStreamAction, CircularBuffer<ByteBuffer>, EventLoopPromise<Void>?)
 
         case read
         case close
-        case wait
+        case wait(EventLoopPromise<Void>?)
 
         case fireChannelActive
         case fireChannelInactive
@@ -80,7 +80,7 @@ struct HTTP1ConnectionStateMachine {
             // Since NIO triggers promise before pipeline, the handler might have been added to the
             // pipeline, before the channelActive callback was triggered. For this reason, we might
             // get the channelActive call twice
-            return .wait
+            return .wait(nil)
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -104,7 +104,7 @@ struct HTTP1ConnectionStateMachine {
             return .fireChannelInactive
 
         case .closed:
-            return .wait
+            return .wait(nil)
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -141,7 +141,7 @@ struct HTTP1ConnectionStateMachine {
 
         switch self.state {
         case .initialized, .idle, .closing, .closed:
-            return .wait
+            return .wait(nil)
         case .inRequest(var requestStateMachine, let close):
             return self.avoidingStateMachineCoW { state -> Action in
                 let action = requestStateMachine.writabilityChanged(writable: writable)
@@ -173,7 +173,7 @@ struct HTTP1ConnectionStateMachine {
             // as closed.
             //
             // TODO: AHC should support a fast rescheduling mechanism here.
-            return .failRequest(HTTPClientError.remoteConnectionClosed, .none)
+            return .failRequest(HTTPClientError.remoteConnectionClosed, .none, nil)
 
         case .idle:
             var requestStateMachine = HTTPRequestStateMachine(isChannelWritable: self.isChannelWritable)
@@ -189,25 +189,25 @@ struct HTTP1ConnectionStateMachine {
         }
     }
 
-    mutating func requestStreamPartReceived(_ part: IOData) -> Action {
+    mutating func requestStreamPartReceived(_ part: IOData, promise: EventLoopPromise<Void>?) -> Action {
         guard case .inRequest(var requestStateMachine, let close) = self.state else {
             preconditionFailure("Invalid state: \(self.state)")
         }
 
         return self.avoidingStateMachineCoW { state -> Action in
-            let action = requestStateMachine.requestStreamPartReceived(part)
+            let action = requestStateMachine.requestStreamPartReceived(part, promise: promise)
             state = .inRequest(requestStateMachine, close: close)
             return state.modify(with: action)
         }
     }
 
-    mutating func requestStreamFinished() -> Action {
+    mutating func requestStreamFinished(promise: EventLoopPromise<Void>?) -> Action {
         guard case .inRequest(var requestStateMachine, let close) = self.state else {
             preconditionFailure("Invalid state: \(self.state)")
         }
 
         return self.avoidingStateMachineCoW { state -> Action in
-            let action = requestStateMachine.requestStreamFinished()
+            let action = requestStateMachine.requestStreamFinished(promise: promise)
             state = .inRequest(requestStateMachine, close: close)
             return state.modify(with: action)
         }
@@ -223,7 +223,7 @@ struct HTTP1ConnectionStateMachine {
                 self.state = .closing
                 return .close
             } else {
-                return .wait
+                return .wait(nil)
             }
 
         case .inRequest(var requestStateMachine, close: let close):
@@ -234,7 +234,7 @@ struct HTTP1ConnectionStateMachine {
             }
 
         case .closing, .closed:
-            return .wait
+            return .wait(nil)
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -284,7 +284,7 @@ struct HTTP1ConnectionStateMachine {
             }
 
         case .closing, .closed:
-            return .wait
+            return .wait(nil)
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -294,7 +294,7 @@ struct HTTP1ConnectionStateMachine {
     mutating func channelReadComplete() -> Action {
         switch self.state {
         case .initialized, .idle, .closing, .closed:
-            return .wait
+            return .wait(nil)
 
         case .inRequest(var requestStateMachine, let close):
             return self.avoidingStateMachineCoW { state -> Action in
@@ -377,15 +377,15 @@ extension HTTP1ConnectionStateMachine.State {
             return .pauseRequestBodyStream
         case .resumeRequestBodyStream:
             return .resumeRequestBodyStream
-        case .sendBodyPart(let part):
-            return .sendBodyPart(part)
-        case .sendRequestEnd:
-            return .sendRequestEnd
+        case .sendBodyPart(let part, let promise):
+            return .sendBodyPart(part, promise)
+        case .sendRequestEnd(let promise):
+            return .sendRequestEnd(promise)
         case .forwardResponseHead(let head, let pauseRequestBodyStream):
             return .forwardResponseHead(head, pauseRequestBodyStream: pauseRequestBodyStream)
         case .forwardResponseBodyParts(let parts):
             return .forwardResponseBodyParts(parts)
-        case .succeedRequest(let finalAction, let finalParts):
+        case .succeedRequest(let finalAction, let finalParts, let promise):
             guard case .inRequest(_, close: let close) = self else {
                 preconditionFailure("Invalid state: \(self)")
             }
@@ -401,9 +401,9 @@ extension HTTP1ConnectionStateMachine.State {
                 self = .idle
                 newFinalAction = close ? .close : .informConnectionIsIdle
             }
-            return .succeedRequest(newFinalAction, finalParts)
+            return .succeedRequest(newFinalAction, finalParts, promise)
 
-        case .failRequest(let error, let finalAction):
+        case .failRequest(let error, let finalAction, let promise):
             switch self {
             case .initialized:
                 preconditionFailure("Invalid state: \(self)")
@@ -412,17 +412,17 @@ extension HTTP1ConnectionStateMachine.State {
             case .inRequest(_, close: let close):
                 if close || finalAction == .close {
                     self = .closing
-                    return .failRequest(error, .close)
+                    return .failRequest(error, .close, promise)
                 } else {
                     self = .idle
-                    return .failRequest(error, .informConnectionIsIdle)
+                    return .failRequest(error, .informConnectionIsIdle, promise)
                 }
 
             case .closing:
-                return .failRequest(error, .none)
+                return .failRequest(error, .none, nil)
             case .closed:
                 // this state can be reached, if the connection was unexpectedly closed by remote
-                return .failRequest(error, .none)
+                return .failRequest(error, .none, nil)
 
             case .modifying:
                 preconditionFailure("Invalid state: \(self)")
@@ -431,8 +431,8 @@ extension HTTP1ConnectionStateMachine.State {
         case .read:
             return .read
 
-        case .wait:
-            return .wait
+        case .wait(let promise):
+            return .wait(promise)
         }
     }
 }
