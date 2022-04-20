@@ -96,7 +96,10 @@ struct HTTPRequestStateMachine {
         case succeedRequest(FinalStreamAction, CircularBuffer<ByteBuffer>, EventLoopPromise<Void>?)
 
         case read
-        case wait(EventLoopPromise<Void>?)
+        case wait
+
+        case failSendBodyPart(Error, EventLoopPromise<Void>?)
+        case failSendStreamFinished(Error, EventLoopPromise<Void>?)
     }
 
     private var state: State = .initialized
@@ -112,7 +115,7 @@ struct HTTPRequestStateMachine {
         case .initialized:
             guard self.isChannelWritable else {
                 self.state = .waitForChannelToBecomeWritable(head, metadata)
-                return .wait(nil)
+                return .wait
             }
             return self.startSendingRequest(head: head, metadata: metadata)
 
@@ -121,7 +124,7 @@ struct HTTPRequestStateMachine {
             // the request was cancelled before hitting the channel handler. Before `startRequest`
             // is called on the state machine, `willExecuteRequest` is called on
             // `HTTPExecutableRequest`, which might loopback to state machines cancel method.
-            return .wait(nil)
+            return .wait
 
         case .running, .finished, .waitForChannelToBecomeWritable, .modifying:
             preconditionFailure("`startRequest()` must be called first, and exactly once. Invalid state: \(self.state)")
@@ -145,7 +148,7 @@ struct HTTPRequestStateMachine {
              .running(.endSent, _),
              .finished,
              .failed:
-            return .wait(nil)
+            return .wait
 
         case .waitForChannelToBecomeWritable(let head, let metadata):
             return self.startSendingRequest(head: head, metadata: metadata)
@@ -154,7 +157,7 @@ struct HTTPRequestStateMachine {
             // If we are receiving a response with a status of >= 300, we should not send out
             // further request body parts. The remote already signaled with status >= 300 that it
             // won't be interested. Let's save some bandwidth.
-            return .wait(nil)
+            return .wait
 
         case .running(.streaming(let expectedBody, let sentBodyBytes, producer: .paused), let responseState):
             let requestState: RequestState = .streaming(
@@ -181,7 +184,7 @@ struct HTTPRequestStateMachine {
              .running(.endSent, _),
              .finished,
              .failed:
-            return .wait(nil)
+            return .wait
 
         case .running(.streaming(let expectedBodyLength, let sentBodyBytes, producer: .producing), let responseState):
             let requestState: RequestState = .streaming(
@@ -216,7 +219,7 @@ struct HTTPRequestStateMachine {
 
         case .finished, .failed:
             // ignore error
-            return .wait(nil)
+            return .wait
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -230,7 +233,7 @@ struct HTTPRequestStateMachine {
             // if we received a NIOSSL.uncleanShutdown before we got an answer we should handle
             // this like a normal connection close. We will receive a call to channelInactive after
             // this error.
-            return .wait(nil)
+            return .wait
 
         case .running(.streaming, .receivingBody(let responseHead, _)),
              .running(.endSent, .receivingBody(let responseHead, _)):
@@ -247,7 +250,7 @@ struct HTTPRequestStateMachine {
                 // receive a complete response, if the content-length or transfer-encoding header
                 // was set. In this case we can ignore the NIOSSLError.uncleanShutdown. We will see
                 // a HTTPParserError very soon.
-                return .wait(nil)
+                return .wait
             }
 
             // If the response is EOF terminated, we need to rely on a clean tls shutdown to be sure
@@ -274,7 +277,7 @@ struct HTTPRequestStateMachine {
             // won't be interested. We expect that the producer has been informed to pause
             // producing.
             assert(producerState == .paused)
-            return .wait(promise)
+            return .failSendBodyPart(HTTPClientError.requestUploadCancelledSinceResponseStatus3xx, promise)
 
         case .running(.streaming(let expectedBodyLength, var sentBodyBytes, let producerState), let responseState):
             // We don't check the producer state here:
@@ -305,8 +308,8 @@ struct HTTPRequestStateMachine {
 
             return .sendBodyPart(part, promise)
 
-        case .failed:
-            return .wait(promise)
+        case .failed(let error):
+            return .failSendBodyPart(error, promise)
 
         case .finished:
             // A request may be finished, before we have send all parts. This might be the case if
@@ -318,7 +321,7 @@ struct HTTPRequestStateMachine {
 
             // We may still receive something, here because of potential race conditions with the
             // producing thread.
-            return .wait(promise)
+            return .failSendBodyPart(HTTPClientError.requestBodyStreamCancelled, promise)
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -364,8 +367,8 @@ struct HTTPRequestStateMachine {
             self.state = .finished
             return .succeedRequest(.sendRequestEnd, .init(), promise)
 
-        case .failed:
-            return .wait(promise)
+        case .failed(let error):
+            return .failSendStreamFinished(error, promise)
 
         case .finished:
             // A request may be finished, before we have send all parts. This might be the case if
@@ -377,7 +380,7 @@ struct HTTPRequestStateMachine {
 
             // We may still receive something, here because of potential race conditions with the
             // producing thread.
-            return .wait(promise)
+            return .failSendStreamFinished(HTTPClientError.requestStreamCancelled, promise)
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -401,10 +404,10 @@ struct HTTPRequestStateMachine {
             return .failRequest(error, .close, nil)
 
         case .finished:
-            return .wait(nil)
+            return .wait
 
         case .failed:
-            return .wait(nil)
+            return .wait
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -419,11 +422,11 @@ struct HTTPRequestStateMachine {
             return .failRequest(error, .none, nil)
 
         case .finished:
-            return .wait(nil)
+            return .wait
 
         case .failed:
             // don't overwrite error
-            return .wait(nil)
+            return .wait
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -477,7 +480,7 @@ struct HTTPRequestStateMachine {
              .running(_, .endReceived),
              .finished,
              .failed:
-            return .wait(nil)
+            return .wait
 
         case .running(let requestState, .receivingBody(let head, var streamState)):
             // This should never happen. But we don't want to precondition this behavior. Let's just
@@ -488,7 +491,7 @@ struct HTTPRequestStateMachine {
                 if let buffer = buffer {
                     return .forwardResponseBodyParts(buffer)
                 } else {
-                    return .wait(nil)
+                    return .wait
                 }
             }
 
@@ -502,7 +505,7 @@ struct HTTPRequestStateMachine {
             // We ignore any leading 1xx headers except for 101 (switching protocols). The
             // HTTP1ConnectionStateMachine ensures the connection close for 101 after the `.end` is
             // received.
-            return .wait(nil)
+            return .wait
         }
 
         switch self.state {
@@ -538,7 +541,7 @@ struct HTTPRequestStateMachine {
         case .running(_, .receivingBody), .running(_, .endReceived), .finished:
             preconditionFailure("How can we successfully finish the request, before having received a head. Invalid state: \(self.state)")
         case .failed:
-            return .wait(nil)
+            return .wait
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -557,14 +560,14 @@ struct HTTPRequestStateMachine {
             return self.avoidingStateMachineCoW { state -> Action in
                 responseStreamState.receivedBodyPart(body)
                 state = .running(requestState, .receivingBody(head, responseStreamState))
-                return .wait(nil)
+                return .wait
             }
 
         case .running(_, .endReceived), .finished:
             preconditionFailure("How can we successfully finish the request, before having received a head. Invalid state: \(self.state)")
 
         case .failed:
-            return .wait(nil)
+            return .wait
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -629,7 +632,7 @@ struct HTTPRequestStateMachine {
             preconditionFailure("How can we receive a response end, if another one was already received. Invalid state: \(self.state)")
 
         case .failed:
-            return .wait(nil)
+            return .wait
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -653,7 +656,7 @@ struct HTTPRequestStateMachine {
         case .running(_, .endReceived),
              .finished,
              .failed:
-            return .wait(nil)
+            return .wait
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -676,7 +679,7 @@ struct HTTPRequestStateMachine {
             preconditionFailure("Invalid state. This state should be: .finished")
 
         case .finished, .failed:
-            return .wait(nil)
+            return .wait
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -741,7 +744,7 @@ extension HTTPRequestStateMachine.ResponseStreamState.Action {
         case .read:
             return .read
         case .wait:
-            return .wait(nil)
+            return .wait
         }
     }
 }

@@ -161,8 +161,8 @@ final class HTTP2ClientRequestHandler: ChannelDuplexHandler {
         case .read:
             context.read()
 
-        case .wait(let promise):
-            promise?.fail(ChannelError.eof)
+        case .wait:
+            break
 
         case .resumeRequestBodyStream:
             // We can force unwrap the request here, as we have just validated in the state machine,
@@ -206,6 +206,9 @@ final class HTTP2ClientRequestHandler: ChannelDuplexHandler {
             self.runTimeoutAction(.clearIdleReadTimeoutTimer, context: context)
             self.runFinalAction(finalAction, context: context)
             promise?.succeed(())
+
+        case .failSendBodyPart(let error, let promise), .failSendStreamFinished(let error, let promise):
+            promise?.fail(error)
         }
     }
 

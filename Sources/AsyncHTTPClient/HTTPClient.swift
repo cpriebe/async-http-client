@@ -937,6 +937,8 @@ public struct HTTPClientError: Error, Equatable, CustomStringConvertible {
         case getConnectionFromPoolTimeout
         case deadlineExceeded
         case httpEndReceivedAfterHeadWith1xx
+        case requestBodyStreamCancelled
+        case requestUploadCancelledSinceResponseStatus3xx
     }
 
     private var code: Code
@@ -1021,6 +1023,16 @@ public struct HTTPClientError: Error, Equatable, CustomStringConvertible {
     ///  - A connection could not be created within the timout period.
     ///  - Tasks are not processed fast enough on the existing connections, to process all waiters in time
     public static let getConnectionFromPoolTimeout = HTTPClientError(code: .getConnectionFromPoolTimeout)
+
+    /// Request body streaming was cancelled before we have send all parts. This might be the case if
+    /// the server responded with an HTTP status code that is equal or larger to 300
+    /// (Redirection, Client Error or Server Error).
+    public static let requestBodyStreamCancelled = HTTPClientError(code: .requestBodyStreamCancelled)
+
+    /// The request upload was cancelled because we received a response head with status >= 300.
+    /// This means we won't send out any further request body bytes. Since the remote signaled with status >= 300, that it
+    /// won't be interested.
+    public static let requestUploadCancelledSinceResponseStatus3xx = HTTPClientError(code: .requestUploadCancelledSinceResponseStatus3xx)
 
     @available(*, deprecated, message: "AsyncHTTPClient now correctly supports informational headers. For this reason `httpEndReceivedAfterHeadWith1xx` will not be thrown anymore.")
     public static let httpEndReceivedAfterHeadWith1xx = HTTPClientError(code: .httpEndReceivedAfterHeadWith1xx)

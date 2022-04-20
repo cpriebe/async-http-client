@@ -55,7 +55,10 @@ struct HTTP1ConnectionStateMachine {
 
         case read
         case close
-        case wait(EventLoopPromise<Void>?)
+        case wait
+
+        case failSendBodyPart(Error, EventLoopPromise<Void>?)
+        case failSendStreamFinished(Error, EventLoopPromise<Void>?)
 
         case fireChannelActive
         case fireChannelInactive
@@ -80,7 +83,7 @@ struct HTTP1ConnectionStateMachine {
             // Since NIO triggers promise before pipeline, the handler might have been added to the
             // pipeline, before the channelActive callback was triggered. For this reason, we might
             // get the channelActive call twice
-            return .wait(nil)
+            return .wait
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -104,7 +107,7 @@ struct HTTP1ConnectionStateMachine {
             return .fireChannelInactive
 
         case .closed:
-            return .wait(nil)
+            return .wait
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -141,7 +144,7 @@ struct HTTP1ConnectionStateMachine {
 
         switch self.state {
         case .initialized, .idle, .closing, .closed:
-            return .wait(nil)
+            return .wait
         case .inRequest(var requestStateMachine, let close):
             return self.avoidingStateMachineCoW { state -> Action in
                 let action = requestStateMachine.writabilityChanged(writable: writable)
@@ -223,7 +226,7 @@ struct HTTP1ConnectionStateMachine {
                 self.state = .closing
                 return .close
             } else {
-                return .wait(nil)
+                return .wait
             }
 
         case .inRequest(var requestStateMachine, close: let close):
@@ -234,7 +237,7 @@ struct HTTP1ConnectionStateMachine {
             }
 
         case .closing, .closed:
-            return .wait(nil)
+            return .wait
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -284,7 +287,7 @@ struct HTTP1ConnectionStateMachine {
             }
 
         case .closing, .closed:
-            return .wait(nil)
+            return .wait
 
         case .modifying:
             preconditionFailure("Invalid state: \(self.state)")
@@ -294,7 +297,7 @@ struct HTTP1ConnectionStateMachine {
     mutating func channelReadComplete() -> Action {
         switch self.state {
         case .initialized, .idle, .closing, .closed:
-            return .wait(nil)
+            return .wait
 
         case .inRequest(var requestStateMachine, let close):
             return self.avoidingStateMachineCoW { state -> Action in
@@ -431,8 +434,14 @@ extension HTTP1ConnectionStateMachine.State {
         case .read:
             return .read
 
-        case .wait(let promise):
-            return .wait(promise)
+        case .wait:
+            return .wait
+
+        case .failSendBodyPart(let error, let promise):
+            return .failSendBodyPart(error, promise)
+
+        case .failSendStreamFinished(let error, let promise):
+            return .failSendStreamFinished(error, promise)
         }
     }
 }

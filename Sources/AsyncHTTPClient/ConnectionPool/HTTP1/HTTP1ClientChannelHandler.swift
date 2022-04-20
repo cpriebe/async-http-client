@@ -223,8 +223,8 @@ final class HTTP1ClientChannelHandler: ChannelDuplexHandler {
         case .close:
             context.close(promise: nil)
 
-        case .wait(let promise):
-            promise?.fail(ChannelError.eof)
+        case .wait:
+            break
 
         case .forwardResponseHead(let head, let pauseRequestBodyStream):
             // We can force unwrap the request here, as we have just validated in the state machine,
@@ -289,6 +289,9 @@ final class HTTP1ClientChannelHandler: ChannelDuplexHandler {
             }
 
             oldRequest.fail(error)
+            promise?.fail(error)
+
+        case .failSendBodyPart(let error, let promise), .failSendStreamFinished(let error, let promise):
             promise?.fail(error)
         }
     }
